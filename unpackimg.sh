@@ -1,6 +1,7 @@
 #!/bin/bash
 # AIK-Linux/unpackimg: split image and unpack ramdisk
 # osm0sis @ xda-developers
+# Modificado para soporte de vendor_boot v4
 
 cleanup() { "$aik/cleanup.sh" $local --quiet; }
 abort() { echo "Error!"; }
@@ -217,10 +218,49 @@ fi;
 
 echo 'Splitting image to "split_img/"...';
 case $imgtype in
-  AOSP_VNDR) vendor=vendor_;;
-esac;
-case $imgtype in
-  AOSP|AOSP_VNDR) "$bin/$arch/unpackbootimg" -i "$img";;
+  AOSP_VNDR) 
+    vendor=vendor_;
+    # Extraer el header version
+    header_version=$(hexdump -n 48 -s 44 -e '1/4 "%d"' "$img" 2>/dev/null)
+    echo "Detected vendor_boot.img with header version: $header_version"
+    echo "$header_version" > "$file-header_version"
+    
+    if [[ "$header_version" == "4" ]]; then
+      echo "Processing vendor_boot v4 ramdisk table"
+      echo "$header_version" > "$file-header_version"
+      
+      # Usar unpackbootimg para extraer componentes básicos
+      "$bin/$arch/unpackbootimg" -i "$img"
+      
+      # Crear directorio para vendor_ramdisk si no existe
+      mkdir -p ../vendor_ramdisk
+      
+      # Extraer y procesar vendor_ramdisk_table
+      if [ -f "$file-vendor_ramdisk" ]; then
+        # Guardar el tamaño del vendor_ramdisk
+        wc -c < "$file-vendor_ramdisk" > "$file-vendor_ramdisk_size"
+        echo "Extracted vendor_ramdisk size: $(cat "$file-vendor_ramdisk_size") bytes"
+        
+        # Extraer vendor_ramdisk_table (los primeros 108 bytes después del ramdisk)
+        dd if="$file-vendor_ramdisk" of="$file-vendor_ramdisk_table" bs=108 count=1 2>/dev/null
+        echo "Extracted vendor_ramdisk_table size: $(wc -c < "$file-vendor_ramdisk_table") bytes"
+        
+        # Mostrar contenido de la tabla para depuración
+        echo "Processing $(($(wc -c < "$file-vendor_ramdisk_table") / 108)) ramdisk fragments"
+        hexdump -C "$file-vendor_ramdisk_table" | head -16
+        
+        # Mover el vendor_ramdisk para su posterior descompresión
+        mv "$file-vendor_ramdisk" "$file-vendor_ramdisk.packed"
+      fi
+      
+      # Finalizando
+      echo "Final ramdisk.packed size: $(wc -c < "$file-vendor_ramdisk.packed") bytes"
+    else
+      # Usar unpackbootimg estándar para versiones anteriores
+      "$bin/$arch/unpackbootimg" -i "$img"
+    fi
+  ;;
+  AOSP) "$bin/$arch/unpackbootimg" -i "$img";;
   AOSP-PXA) "$bin/$arch/pxa-unpackbootimg" -i "$img";;
   ELF)
     mkdir elftool_out;
@@ -271,7 +311,14 @@ if [ -f *-kernel ] && [ "$(file -m "$bin/androidbootimg.magic" *-kernel 2>/dev/n
   dd bs=512 skip=1 conv=notrunc if="$file-kernel" of=tempkern 2>/dev/null;
   mv -f tempkern "$file-kernel";
 fi;
-mtktest="$(file -m "$bin/androidbootimg.magic" *-*ramdisk 2>/dev/null | cut -d: -f2-)";
+
+# Manejar ramdisk normal o vendor_ramdisk
+if [ "$header_version" == "4" ] && [ -f "$file-vendor_ramdisk.packed" ]; then
+  mtktest="$(file -m "$bin/androidbootimg.magic" "$file-vendor_ramdisk.packed" 2>/dev/null | cut -d: -f2-)";
+else
+  mtktest="$(file -m "$bin/androidbootimg.magic" *-*ramdisk 2>/dev/null | cut -d: -f2-)";
+fi;
+
 mtktype=$(echo $mtktest | awk '{ print $3 }');
 if [ "$(echo $mtktest | awk '{ print $1 }')" = "MTK" ]; then
   if [ ! "$mtk" ]; then
@@ -279,9 +326,15 @@ if [ "$(echo $mtktest | awk '{ print $1 }')" = "MTK" ]; then
     echo "Warning: No MTK header found in kernel!";
     mtk=1;
   fi;
-  echo "MTK header found in \"$mtktype\" type ramdisk, removing...";
-  dd bs=512 skip=1 conv=notrunc if="$(ls *-*ramdisk)" of=temprd 2>/dev/null;
-  mv -f temprd "$(ls *-*ramdisk)";
+  if [ "$header_version" == "4" ] && [ -f "$file-vendor_ramdisk.packed" ]; then
+    echo "MTK header found in \"$mtktype\" type vendor_ramdisk, removing...";
+    dd bs=512 skip=1 conv=notrunc if="$file-vendor_ramdisk.packed" of=temprd 2>/dev/null;
+    mv -f temprd "$file-vendor_ramdisk.packed";
+  else
+    echo "MTK header found in \"$mtktype\" type ramdisk, removing...";
+    dd bs=512 skip=1 conv=notrunc if="$(ls *-*ramdisk)" of=temprd 2>/dev/null;
+    mv -f temprd "$(ls *-*ramdisk)";
+  fi;
 else
   if [ "$mtk" ]; then
     if [ ! "$mtktype" ]; then
@@ -308,8 +361,17 @@ if [ -f *-dt ]; then
   fi;
 fi;
 
-file -m "$bin/magic" *-*ramdisk 2>/dev/null | cut -d: -f2 | awk '{ print $1 }' > "$file-${vendor}ramdiskcomp";
-ramdiskcomp=`cat *-*ramdiskcomp`;
+# Determinar qué archivo de ramdisk procesar
+if [ "$header_version" == "4" ] && [ -f "$file-vendor_ramdisk.packed" ]; then
+  ramdisk_file="$file-vendor_ramdisk.packed"
+  ramdisk_prefix="vendor_"
+else
+  ramdisk_file="$(ls *-*ramdisk)"
+  ramdisk_prefix="${vendor}"
+fi;
+
+file -m "$bin/magic" "$ramdisk_file" 2>/dev/null | cut -d: -f2 | awk '{ print $1 }' > "$file-${ramdisk_prefix}ramdiskcomp";
+ramdiskcomp=`cat "$file-${ramdisk_prefix}ramdiskcomp"`;
 unpackcmd="$ramdiskcomp -dc";
 compext=$ramdiskcomp;
 case $ramdiskcomp in
@@ -327,7 +389,9 @@ esac;
 if [ "$compext" ]; then
   compext=.$compext;
 fi;
-mv -f "$(ls *-*ramdisk)" "$file-${vendor}ramdisk.cpio$compext" 2>/dev/null;
+
+# Mover el archivo de ramdisk con la extensión correcta
+mv -f "$ramdisk_file" "$file-${ramdisk_prefix}ramdisk.cpio$compext" 2>/dev/null;
 cd ..;
 if [ "$ramdiskcomp" = "data" ]; then
   echo "Unrecognized format.";
@@ -339,7 +403,15 @@ echo " ";
 if [ "$ramdiskcomp" = "empty" ]; then
   echo "Warning: No ramdisk found to be unpacked!";
 else
-  echo "Unpacking ramdisk$sumsg to \"ramdisk/\"...";
+  # Determinar el directorio de destino
+  if [ "$header_version" == "4" ] && [ "$ramdisk_prefix" == "vendor_" ]; then
+    ramdisk_dir="vendor_ramdisk"
+    echo "Unpacking vendor_ramdisk$sumsg to \"vendor_ramdisk/\"...";
+  else
+    ramdisk_dir="ramdisk"
+    echo "Unpacking ramdisk$sumsg to \"ramdisk/\"...";
+  fi;
+  
   echo " ";
   if [ "$cpiowarning" ]; then
     echo "Warning: Using cpio 2.13 may result in an unusable repack; downgrade to 2.12 to be safe!";
@@ -351,9 +423,9 @@ else
     abort;
     exit 1;
   fi;
-  $sudo chown 0:0 ramdisk 2>/dev/null;
-  cd ramdisk;
-  $unpackcmd "../split_img/$file-${vendor}ramdisk.cpio$compext" | $sudo $cpio -i -d --no-absolute-filenames;
+  $sudo chown 0:0 $ramdisk_dir 2>/dev/null;
+  cd $ramdisk_dir;
+  $unpackcmd "../split_img/$file-${ramdisk_prefix}ramdisk.cpio$compext" | $sudo $cpio -i -d --no-absolute-filenames;
   if [ ! $? -eq "0" ]; then
     [ "$nosudo" ] && echo "Unpacking failed, try without --nosudo.";
     cd ..;
@@ -366,4 +438,3 @@ fi;
 echo " ";
 echo "Done!";
 exit 0;
-
