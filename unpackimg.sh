@@ -221,7 +221,7 @@ case $imgtype in
   AOSP_VNDR) 
     vendor=vendor_;
     # Extraer el header version
-    header_version=$(hexdump -n 48 -s 44 -e '1/4 "%d"' "$img" 2>/dev/null)
+    header_version=$(dd if="$img" bs=1 skip=40 count=4 2>/dev/null | od -An -t u4 | tr -d ' ')
     echo "Detected vendor_boot.img with header version: $header_version"
     echo "$header_version" > "$file-header_version"
     
