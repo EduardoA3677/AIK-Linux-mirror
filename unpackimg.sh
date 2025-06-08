@@ -85,8 +85,11 @@ file=$(basename "$img");
 echo "Supplied image: $file";
 echo " ";
 
-if [ -d split_img -o -d ramdisk ]; then
+if [ -d split_img -o -d ramdisk -o -d vendor_ramdisk ]; then
   if [ -d ramdisk ] && [ "$(stat $statarg ramdisk | head -n 1)" = "root" -o ! "$(find ramdisk 2>&1 | cpio -o >/dev/null 2>&1; echo $?)" -eq "0" ]; then
+    rmsumsg=" (as root)";
+  fi;
+  if [ -d vendor_ramdisk ] && [ "$(stat $statarg vendor_ramdisk | head -n 1)" = "root" -o ! "$(find vendor_ramdisk 2>&1 | cpio -o >/dev/null 2>&1; echo $?)" -eq "0" ]; then
     rmsumsg=" (as root)";
   fi;
   echo "Removing old work folders and files$rmsumsg...";
@@ -101,207 +104,252 @@ mkdir split_img ramdisk;
 cd split_img;
 filesize=$(wc -c < "$img");
 echo "$filesize" > "$file-origsize";
-imgtest="$(file -m "$bin/androidsign.magic" "$img" 2>/dev/null | cut -d: -f2-)";
-if [ "$(echo $imgtest | awk '{ print $2 }' | cut -d, -f1)" = "signing" ]; then
-  echo $imgtest | awk '{ print $1 }' > "$file-sigtype";
-  sigtype=$(cat "$file-sigtype");
-  echo "Signature with \"$sigtype\" type detected, removing...";
-  echo " ";
-  case $sigtype in
-    BLOB)
-      cp -f "$img" "$file";
-      "$bin/$arch/blobunpack" "$file" | tail -n+5 | cut -d" " -f2 | dd bs=1 count=3 > "$file-blobtype" 2>/dev/null;
-      mv -f "$file."* "$file";
-    ;;
-    CHROMEOS) "$bin/$arch/futility" vbutil_kernel --get-vmlinuz "$img" --vmlinuz-out "$file";;
-    DHTB) dd bs=4096 skip=512 iflag=skip_bytes conv=notrunc if="$img" of="$file" 2>/dev/null;;
-    NOOK)
-      dd bs=1048576 count=1 conv=notrunc if="$img" of="$file-master_boot.key" 2>/dev/null;
-      dd bs=1048576 skip=1 conv=notrunc if="$img" of="$file" 2>/dev/null;
-    ;;
-    NOOKTAB)
-      dd bs=262144 count=1 conv=notrunc if="$img" of="$file-master_boot.key" 2>/dev/null;
-      dd bs=262144 skip=1 conv=notrunc if="$img" of="$file" 2>/dev/null;
-    ;;
-    SIN*)
-      "$bin/$arch/sony_dump" . "$img" >/dev/null;
-      mv -f "$file."* "$file";
-      rm -f "$file-sigtype";
-    ;;
-  esac;
-  [ -f "$file" ] && img="$file";
-fi;
 
-imgtest="$(file -m "$bin/androidbootimg.magic" "$img" 2>/dev/null | cut -d: -f2-)";
-if [ "$(echo $imgtest | awk '{ print $2 }' | cut -d, -f1)" = "bootimg" ]; then
-  [ "$(echo $imgtest | awk '{ print $3 }')" = "PXA" ] && typesuffix=-PXA;
-  echo "$(echo $imgtest | awk '{ print $1 }')$typesuffix" > "$file-imgtype";
-  imgtype=$(cat "$file-imgtype");
+# Detectar tipo de imagen usando magic numbers
+boot_magic=$(dd if="$img" bs=8 count=1 2>/dev/null)
+if [ "$boot_magic" = "VNDRBOOT" ]; then
+  echo "AOSP_VNDR" > "$file-imgtype";
+  imgtype="AOSP_VNDR";
+  vendor=vendor_;
+  
+  # Extraer header version para vendor_boot
+  header_version=$(dd if="$img" bs=1 skip=12 count=4 2>/dev/null | od -An -t u4 -N4 | tr -d ' ')
+  echo "Detected vendor_boot.img with header version: $header_version"
+  echo "$header_version" > "$file-header_version"
+  
+elif [ "$boot_magic" = "ANDROID!" ]; then
+  echo "AOSP" > "$file-imgtype";
+  imgtype="AOSP";
+  
+  # Extraer header version para boot normal
+  header_version=$(dd if="$img" bs=1 skip=40 count=4 2>/dev/null | od -An -t u4 -N4 | tr -d ' ')
+  echo "Detected boot.img with header version: $header_version"
+  echo "$header_version" > "$file-header_version"
 else
-  cd ..;
-  cleanup;
-  echo "Unrecognized format.";
-  abort;
-  exit 1;
-fi;
-echo "Image type: $imgtype";
-echo " ";
-
-case $imgtype in
-  AOSP*|ELF|KRNL|OSIP|U-Boot) ;;
-  *)
+  # Fallback al método original
+  imgtest="$(file -m "$bin/androidbootimg.magic" "$img" 2>/dev/null | cut -d: -f2-)";
+  if [ "$(echo $imgtest | awk '{ print $2 }' | cut -d, -f1)" = "bootimg" ]; then
+    [ "$(echo $imgtest | awk '{ print $3 }')" = "PXA" ] && typesuffix=-PXA;
+    echo "$(echo $imgtest | awk '{ print $1 }')$typesuffix" > "$file-imgtype";
+    imgtype=$(cat "$file-imgtype");
+  else
     cd ..;
     cleanup;
-    echo "Unsupported format.";
+    echo "Unrecognized format.";
     abort;
     exit 1;
-  ;;
-esac;
-
-case $(echo $imgtest | awk '{ print $3 }') in
-  LOKI)
-    echo $imgtest | awk '{ print $5 }' | cut -d\( -f2 | cut -d\) -f1 > "$file-lokitype";
-    lokitype=$(cat "$file-lokitype");
-    echo "Loki patch with \"$lokitype\" type detected, reverting...";
-    echo " ";
-    echo "Warning: A dump of your device's aboot.img is required to re-Loki!";
-    echo " ";
-    "$bin/$arch/loki_tool" unlok "$img" "$file" >/dev/null;
-    img="$file";
-  ;;
-  AMONET)
-    echo "Amonet patch detected, reverting...";
-    echo " ";
-    dd bs=2048 count=1 conv=notrunc if="$img" of="$file-microloader.bin" 2>/dev/null;
-    dd bs=1024 skip=1 conv=notrunc if="$file-microloader.bin" of="$file-head" 2>/dev/null;
-    truncate -s 1024 "$file-microloader.bin";
-    truncate -s 2048 "$file-head";
-    dd bs=2048 skip=1 conv=notrunc if="$img" of="$file-tail" 2>/dev/null;
-    cat "$file-head" "$file-tail" > "$file";
-    rm -f "$file-head" "$file-tail";
-    img="$file";
-  ;;
-esac;
-
-tailtest="$(dd if="$img" iflag=skip_bytes skip=$(($(wc -c < "$img") - 8192)) bs=8192 count=1 2>/dev/null | file -m $bin/androidsign.magic - 2>/dev/null | cut -d: -f2-)";
-case $tailtest in
-  *data) tailtest="$(tail -n50 "$img" | file -m "$bin/androidsign.magic" - 2>/dev/null | cut -d: -f2-)";;
-esac;
-tailtype="$(echo $tailtest | awk '{ print $1 }')";
-case $tailtype in
-  AVB*)
-    echo "Signature with \"$tailtype\" type detected.";
-    echo " ";
-    echo $tailtype > "$file-sigtype";
-    case $tailtype in
-      *v1)
-        echo $tailtest | awk '{ print $4 }' > "$file-avbtype";
-      ;;
-    esac;
-  ;;
-  Bump|SEAndroid)
-    echo "Footer with \"$tailtype\" type detected.";
-    echo " ";
-    echo $tailtype > "$file-tailtype";
-  ;;
-esac;
-
-if [ "$imgtype" = "U-Boot" ]; then
-  imgsize=$(($(printf '%d\n' 0x$(hexdump -n 4 -s 12 -e '16/1 "%02x""\n"' "$img")) + 64));
-  if [ ! "$filesize" = "$imgsize" ]; then
-    echo "Trimming...";
-    echo " ";
-    dd bs=$imgsize count=1 conv=notrunc if="$img" of="$file" 2>/dev/null;
-    img="$file";
   fi;
 fi;
 
-echo 'Splitting image to "split_img/"...';
-case $imgtype in
-  AOSP_VNDR) 
-    vendor=vendor_;
-    # Extraer el header version
-    header_version=$(dd if="$img" bs=1 skip=40 count=4 2>/dev/null | od -An -t u4 | tr -d ' ')
-    echo "Detected vendor_boot.img with header version: $header_version"
-    echo "$header_version" > "$file-header_version"
+echo "Image type: $imgtype";
+echo " ";
+
+# Detectar y manejar vendor_boot v4 usando la lógica de AOSP
+if [ "$imgtype" = "AOSP_VNDR" ] && [ "$header_version" = "4" ]; then
+  echo "Processing vendor_boot v4 with multiple ramdisk fragments...";
+  echo " ";
+  
+  # Crear directorio para vendor_ramdisk
+  mkdir -p ../vendor_ramdisk;
+  
+  # Usar el extractor basado en la lógica de AOSP unpack_bootimg.py
+  python3 -c "
+import struct
+import os
+import sys
+
+def cstr(s):
+    return s.split(b'\0', 1)[0].decode()
+
+def get_number_of_pages(image_size, page_size):
+    return (image_size + page_size - 1) // page_size
+
+def extract_image(img, offset, size, output_name):
+    with open(img, 'rb') as f:
+        f.seek(offset)
+        data = f.read(size)
+    with open(output_name, 'wb') as f:
+        f.write(data)
+
+# Leer vendor_boot v4
+img_path = '$img'
+with open(img_path, 'rb') as f:
+    # Leer header básico
+    magic = f.read(8)
+    header_version = struct.unpack('<I', f.read(4))[0]
+    page_size = struct.unpack('<I', f.read(4))[0]
+    kernel_load_address = struct.unpack('<I', f.read(4))[0]
+    ramdisk_load_address = struct.unpack('<I', f.read(4))[0]
+    vendor_ramdisk_size = struct.unpack('<I', f.read(4))[0]
     
-    if [[ "$header_version" == "4" ]]; then
-      echo "Processing vendor_boot v4 ramdisk table"
-      echo "$header_version" > "$file-header_version"
-      
-      # Usar unpackbootimg para extraer componentes básicos
-      "$bin/$arch/unpackbootimg" -i "$img"
-      
-      # Crear directorio para vendor_ramdisk si no existe
-      mkdir -p ../vendor_ramdisk
-      
-      # Extraer y procesar vendor_ramdisk_table
-      if [ -f "$file-vendor_ramdisk" ]; then
-        # Guardar el tamaño del vendor_ramdisk
-        wc -c < "$file-vendor_ramdisk" > "$file-vendor_ramdisk_size"
-        echo "Extracted vendor_ramdisk size: $(cat "$file-vendor_ramdisk_size") bytes"
-        
-        # Extraer vendor_ramdisk_table (los primeros 108 bytes después del ramdisk)
-        dd if="$file-vendor_ramdisk" of="$file-vendor_ramdisk_table" bs=108 count=1 2>/dev/null
-        echo "Extracted vendor_ramdisk_table size: $(wc -c < "$file-vendor_ramdisk_table") bytes"
-        
-        # Mostrar contenido de la tabla para depuración
-        echo "Processing $(($(wc -c < "$file-vendor_ramdisk_table") / 108)) ramdisk fragments"
-        hexdump -C "$file-vendor_ramdisk_table" | head -16
-        
-        # Mover el vendor_ramdisk para su posterior descompresión
-        mv "$file-vendor_ramdisk" "$file-vendor_ramdisk.packed"
-      fi
-      
-      # Finalizando
-      echo "Final ramdisk.packed size: $(wc -c < "$file-vendor_ramdisk.packed") bytes"
-    else
-      # Usar unpackbootimg estándar para versiones anteriores
-      "$bin/$arch/unpackbootimg" -i "$img"
+    # Saltar cmdline (2048 bytes)
+    f.seek(8 + 4 + 4 + 4 + 4 + 4 + 2048)
+    
+    tags_load_address = struct.unpack('<I', f.read(4))[0]
+    product_name = cstr(f.read(16))
+    header_size = struct.unpack('<I', f.read(4))[0]
+    dtb_size = struct.unpack('<I', f.read(4))[0]
+    dtb_load_address = struct.unpack('<Q', f.read(8))[0]
+    
+    # Información específica de v4
+    vendor_ramdisk_table_size = struct.unpack('<I', f.read(4))[0]
+    vendor_ramdisk_table_entry_num = struct.unpack('<I', f.read(4))[0]
+    vendor_ramdisk_table_entry_size = struct.unpack('<I', f.read(4))[0]
+    vendor_bootconfig_size = struct.unpack('<I', f.read(4))[0]
+
+# Guardar información extraída
+with open('$file-page_size', 'w') as f:
+    f.write(str(page_size))
+with open('$file-vendor_ramdisk_size', 'w') as f:
+    f.write(str(vendor_ramdisk_size))
+with open('$file-vendor_ramdisk_table_size', 'w') as f:
+    f.write(str(vendor_ramdisk_table_size))
+with open('$file-vendor_ramdisk_table_entry_num', 'w') as f:
+    f.write(str(vendor_ramdisk_table_entry_num))
+with open('$file-vendor_bootconfig_size', 'w') as f:
+    f.write(str(vendor_bootconfig_size))
+with open('$file-board', 'w') as f:
+    f.write(product_name)
+
+# Calcular offsets según la lógica de AOSP
+num_boot_header_pages = get_number_of_pages(header_size, page_size)
+num_boot_ramdisk_pages = get_number_of_pages(vendor_ramdisk_size, page_size)
+num_boot_dtb_pages = get_number_of_pages(dtb_size, page_size)
+num_vendor_ramdisk_table_pages = get_number_of_pages(vendor_ramdisk_table_size, page_size)
+
+ramdisk_offset_base = page_size * num_boot_header_pages
+vendor_ramdisk_table_offset = page_size * (num_boot_header_pages + num_boot_ramdisk_pages + num_boot_dtb_pages)
+dtb_offset = page_size * (num_boot_header_pages + num_boot_ramdisk_pages)
+bootconfig_offset = page_size * (num_boot_header_pages + num_boot_ramdisk_pages + num_boot_dtb_pages + num_vendor_ramdisk_table_pages)
+
+print(f'Vendor ramdisk size: {vendor_ramdisk_size}')
+print(f'Vendor ramdisk table size: {vendor_ramdisk_table_size}')
+print(f'Vendor ramdisk table entries: {vendor_ramdisk_table_entry_num}')
+print(f'Vendor bootconfig size: {vendor_bootconfig_size}')
+
+# Extraer vendor ramdisk fragments
+for idx in range(vendor_ramdisk_table_entry_num):
+    entry_offset = vendor_ramdisk_table_offset + (vendor_ramdisk_table_entry_size * idx)
+    with open(img_path, 'rb') as f:
+        f.seek(entry_offset)
+        ramdisk_size = struct.unpack('<I', f.read(4))[0]
+        ramdisk_offset = struct.unpack('<I', f.read(4))[0]
+        ramdisk_type = struct.unpack('<I', f.read(4))[0]
+        ramdisk_name = cstr(f.read(32))
+        board_id = struct.unpack('<16I', f.read(16 * 4))
+    
+    output_name = f'$file-vendor_ramdisk{idx:02d}'
+    extract_image(img_path, ramdisk_offset_base + ramdisk_offset, ramdisk_size, output_name)
+    print(f'Extracted {output_name} (size: {ramdisk_size}, type: {ramdisk_type:#x}, name: {ramdisk_name})')
+
+# Extraer DTB si existe
+if dtb_size > 0:
+    extract_image(img_path, dtb_offset, dtb_size, '$file-dtb')
+    print(f'Extracted DTB (size: {dtb_size})')
+
+# Extraer bootconfig si existe  
+if vendor_bootconfig_size > 0:
+    extract_image(img_path, bootconfig_offset, vendor_bootconfig_size, '$file-bootconfig')
+    print(f'Extracted bootconfig (size: {vendor_bootconfig_size})')
+
+# Determinar cuál vendor_ramdisk usar como principal
+main_ramdisk = None
+for idx in range(vendor_ramdisk_table_entry_num):
+    ramdisk_file = f'$file-vendor_ramdisk{idx:02d}'
+    if os.path.exists(ramdisk_file) and os.path.getsize(ramdisk_file) > 0:
+        main_ramdisk = ramdisk_file
+        break
+
+if main_ramdisk:
+    # Copiar el ramdisk principal
+    import shutil
+    shutil.copy(main_ramdisk, '$file-vendor_ramdisk')
+    print(f'Using {main_ramdisk} as main vendor_ramdisk')
+else:
+    # Crear un ramdisk vacío si no hay ninguno válido
+    with open('$file-vendor_ramdisk', 'wb') as f:
+        pass
+    print('No valid vendor_ramdisk found, created empty file')
+"
+  
+  if [ $? -ne 0 ]; then
+    echo "Failed to extract vendor_boot v4";
+    cd ..;
+    cleanup;
+    abort;
+    exit 1;
+  fi;
+  
+  # Determinar qué ramdisk procesar
+  main_ramdisk=""
+  ramdisk_count=$(cat "$file-vendor_ramdisk_table_entry_num" 2>/dev/null || echo "0")
+  
+  for i in $(seq 0 $((ramdisk_count - 1))); do
+    fragment_file=$(printf "$file-vendor_ramdisk%02d" $i)
+    if [ -f "$fragment_file" ] && [ -s "$fragment_file" ]; then
+      main_ramdisk="$fragment_file"
+      echo "Selected $main_ramdisk as main ramdisk for unpacking"
+      break
     fi
-  ;;
-  AOSP) "$bin/$arch/unpackbootimg" -i "$img";;
-  AOSP-PXA) "$bin/$arch/pxa-unpackbootimg" -i "$img";;
-  ELF)
-    mkdir elftool_out;
-    "$bin/$arch/elftool" unpack -i "$img" -o elftool_out >/dev/null;
-    mv -f elftool_out/header "$file-header" 2>/dev/null;
-    rm -rf elftool_out;
-    "$bin/$arch/unpackelf" -i "$img";
-  ;;
-  KRNL) dd bs=4096 skip=8 iflag=skip_bytes conv=notrunc if="$img" of="$file-ramdisk" 2>&1 | tail -n+3 | cut -d" " -f1-2;;
-  OSIP)
-    "$bin/$arch/mboot" -u -f "$img";
-    [ ! $? -eq "0" ] && error=1;
-    for i in bootstub cmdline.txt hdr kernel parameter ramdisk.cpio.gz sig; do
-      mv -f $i "$file-$(basename $i .txt | sed -e 's/hdr/header/' -e 's/ramdisk.cpio.gz/ramdisk/')" 2>/dev/null || true;
-    done;
-  ;;
-  U-Boot)
-    "$bin/$arch/dumpimage" -l "$img";
-    "$bin/$arch/dumpimage" -l "$img" > "$file-header";
-    grep "Name:" "$file-header" | cut -c15- > "$file-name";
-    grep "Type:" "$file-header" | cut -c15- | cut -d" " -f1 > "$file-arch";
-    grep "Type:" "$file-header" | cut -c15- | cut -d" " -f2 > "$file-os";
-    grep "Type:" "$file-header" | cut -c15- | cut -d" " -f3 | cut -d- -f1 > "$file-type";
-    grep "Type:" "$file-header" | cut -d\( -f2 | cut -d\) -f1 | cut -d" " -f1 | cut -d- -f1 > "$file-comp";
-    grep "Address:" "$file-header" | cut -c15- > "$file-addr";
-    grep "Point:" "$file-header" | cut -c15- > "$file-ep";
-    rm -f "$file-header";
-    "$bin/$arch/dumpimage" -p 0 -o "$file-kernel" "$img";
-    [ ! $? -eq "0" ] && error=1;
-    case $(cat "$file-type") in
-      Multi) "$bin/$arch/dumpimage" -p 1 -o "$file-ramdisk" "$img";;
-      RAMDisk) mv -f "$file-kernel" "$file-ramdisk";;
-      *) touch "$file-ramdisk";;
-    esac;
-  ;;
-esac;
-if [ ! $? -eq "0" -o "$error" ]; then
-  cd ..;
-  cleanup;
-  abort;
-  exit 1;
+  done
+  
+  if [ -z "$main_ramdisk" ]; then
+    echo "Warning: No valid vendor_ramdisk fragments found!"
+    touch "$file-vendor_ramdisk"
+  else
+    cp "$main_ramdisk" "$file-vendor_ramdisk"
+  fi
+  
+else
+  # Usar unpackbootimg estándar para otros tipos
+  case $imgtype in
+    AOSP_VNDR) 
+      vendor=vendor_;
+      "$bin/$arch/unpackbootimg" -i "$img"
+    ;;
+    AOSP) "$bin/$arch/unpackbootimg" -i "$img";;
+    AOSP-PXA) "$bin/$arch/pxa-unpackbootimg" -i "$img";;
+    ELF)
+      mkdir elftool_out;
+      "$bin/$arch/elftool" unpack -i "$img" -o elftool_out >/dev/null;
+      mv -f elftool_out/header "$file-header" 2>/dev/null;
+      rm -rf elftool_out;
+      "$bin/$arch/unpackelf" -i "$img";
+    ;;
+    KRNL) dd bs=4096 skip=8 iflag=skip_bytes conv=notrunc if="$img" of="$file-ramdisk" 2>&1 | tail -n+3 | cut -d" " -f1-2;;
+    OSIP)
+      "$bin/$arch/mboot" -u -f "$img";
+      [ ! $? -eq "0" ] && error=1;
+      for i in bootstub cmdline.txt hdr kernel parameter ramdisk.cpio.gz sig; do
+        mv -f $i "$file-$(basename $i .txt | sed -e 's/hdr/header/' -e 's/ramdisk.cpio.gz/ramdisk/')" 2>/dev/null || true;
+      done;
+    ;;
+    U-Boot)
+      "$bin/$arch/dumpimage" -l "$img";
+      "$bin/$arch/dumpimage" -l "$img" > "$file-header";
+      grep "Name:" "$file-header" | cut -c15- > "$file-name";
+      grep "Type:" "$file-header" | cut -c15- | cut -d" " -f1 > "$file-arch";
+      grep "Type:" "$file-header" | cut -c15- | cut -d" " -f2 > "$file-os";
+      grep "Type:" "$file-header" | cut -c15- | cut -d" " -f3 | cut -d- -f1 > "$file-type";
+      grep "Type:" "$file-header" | cut -d\( -f2 | cut -d\) -f1 | cut -d" " -f1 | cut -d- -f1 > "$file-comp";
+      grep "Address:" "$file-header" | cut -c15- > "$file-addr";
+      grep "Point:" "$file-header" | cut -c15- > "$file-ep";
+      rm -f "$file-header";
+      "$bin/$arch/dumpimage" -p 0 -o "$file-kernel" "$img";
+      [ ! $? -eq "0" ] && error=1;
+      case $(cat "$file-type") in
+        Multi) "$bin/$arch/dumpimage" -p 1 -o "$file-ramdisk" "$img";;
+        RAMDisk) mv -f "$file-kernel" "$file-ramdisk";;
+        *) touch "$file-ramdisk";;
+      esac;
+    ;;
+  esac;
+  if [ ! $? -eq "0" -o "$error" ]; then
+    cd ..;
+    cleanup;
+    abort;
+    exit 1;
+  fi;
 fi;
 
 if [ -f *-kernel ] && [ "$(file -m "$bin/androidbootimg.magic" *-kernel 2>/dev/null | cut -d: -f2 | awk '{ print $1 }')" = "MTK" ]; then
@@ -312,13 +360,30 @@ if [ -f *-kernel ] && [ "$(file -m "$bin/androidbootimg.magic" *-kernel 2>/dev/n
   mv -f tempkern "$file-kernel";
 fi;
 
-# Manejar ramdisk normal o vendor_ramdisk
-if [ "$header_version" == "4" ] && [ -f "$file-vendor_ramdisk.packed" ]; then
-  mtktest="$(file -m "$bin/androidbootimg.magic" "$file-vendor_ramdisk.packed" 2>/dev/null | cut -d: -f2-)";
+# Determinar qué archivo de ramdisk procesar
+if [ "$imgtype" = "AOSP_VNDR" ] && [ "$header_version" = "4" ]; then
+  ramdisk_file="$file-vendor_ramdisk"
+  ramdisk_prefix="vendor_"
+  ramdisk_dir="vendor_ramdisk"
+  mkdir -p "../$ramdisk_dir"
+elif [ "$vendor" = "vendor_" ]; then
+  ramdisk_file="$(ls *-*vendor*ramdisk 2>/dev/null | head -1)"
+  ramdisk_prefix="vendor_"
+  ramdisk_dir="ramdisk"
 else
-  mtktest="$(file -m "$bin/androidbootimg.magic" *-*ramdisk 2>/dev/null | cut -d: -f2-)";
+  ramdisk_file="$(ls *-*ramdisk 2>/dev/null | head -1)"
+  ramdisk_prefix=""
+  ramdisk_dir="ramdisk"
 fi;
 
+if [ -z "$ramdisk_file" ] || [ ! -f "$ramdisk_file" ]; then
+  echo "Warning: No ramdisk file found!";
+  touch "$file-${ramdisk_prefix}ramdisk"
+  ramdisk_file="$file-${ramdisk_prefix}ramdisk"
+fi;
+
+# Verificar MTK en ramdisk
+mtktest="$(file -m "$bin/androidbootimg.magic" "$ramdisk_file" 2>/dev/null | cut -d: -f2-)";
 mtktype=$(echo $mtktest | awk '{ print $3 }');
 if [ "$(echo $mtktest | awk '{ print $1 }')" = "MTK" ]; then
   if [ ! "$mtk" ]; then
@@ -326,15 +391,9 @@ if [ "$(echo $mtktest | awk '{ print $1 }')" = "MTK" ]; then
     echo "Warning: No MTK header found in kernel!";
     mtk=1;
   fi;
-  if [ "$header_version" == "4" ] && [ -f "$file-vendor_ramdisk.packed" ]; then
-    echo "MTK header found in \"$mtktype\" type vendor_ramdisk, removing...";
-    dd bs=512 skip=1 conv=notrunc if="$file-vendor_ramdisk.packed" of=temprd 2>/dev/null;
-    mv -f temprd "$file-vendor_ramdisk.packed";
-  else
-    echo "MTK header found in \"$mtktype\" type ramdisk, removing...";
-    dd bs=512 skip=1 conv=notrunc if="$(ls *-*ramdisk)" of=temprd 2>/dev/null;
-    mv -f temprd "$(ls *-*ramdisk)";
-  fi;
+  echo "MTK header found in \"$mtktype\" type ramdisk, removing...";
+  dd bs=512 skip=1 conv=notrunc if="$ramdisk_file" of=temprd 2>/dev/null;
+  mv -f temprd "$ramdisk_file";
 else
   if [ "$mtk" ]; then
     if [ ! "$mtktype" ]; then
@@ -361,15 +420,7 @@ if [ -f *-dt ]; then
   fi;
 fi;
 
-# Determinar qué archivo de ramdisk procesar
-if [ "$header_version" == "4" ] && [ -f "$file-vendor_ramdisk.packed" ]; then
-  ramdisk_file="$file-vendor_ramdisk.packed"
-  ramdisk_prefix="vendor_"
-else
-  ramdisk_file="$(ls *-*ramdisk)"
-  ramdisk_prefix="${vendor}"
-fi;
-
+# Detectar compresión del ramdisk
 file -m "$bin/magic" "$ramdisk_file" 2>/dev/null | cut -d: -f2 | awk '{ print $1 }' > "$file-${ramdisk_prefix}ramdiskcomp";
 ramdiskcomp=`cat "$file-${ramdisk_prefix}ramdiskcomp"`;
 unpackcmd="$ramdiskcomp -dc";
@@ -393,6 +444,7 @@ fi;
 # Mover el archivo de ramdisk con la extensión correcta
 mv -f "$ramdisk_file" "$file-${ramdisk_prefix}ramdisk.cpio$compext" 2>/dev/null;
 cd ..;
+
 if [ "$ramdiskcomp" = "data" ]; then
   echo "Unrecognized format.";
   abort;
@@ -403,15 +455,7 @@ echo " ";
 if [ "$ramdiskcomp" = "empty" ]; then
   echo "Warning: No ramdisk found to be unpacked!";
 else
-  # Determinar el directorio de destino
-  if [ "$header_version" == "4" ] && [ "$ramdisk_prefix" == "vendor_" ]; then
-    ramdisk_dir="vendor_ramdisk"
-    echo "Unpacking vendor_ramdisk$sumsg to \"vendor_ramdisk/\"...";
-  else
-    ramdisk_dir="ramdisk"
-    echo "Unpacking ramdisk$sumsg to \"ramdisk/\"...";
-  fi;
-  
+  echo "Unpacking ramdisk$sumsg to \"$ramdisk_dir/\"...";
   echo " ";
   if [ "$cpiowarning" ]; then
     echo "Warning: Using cpio 2.13 may result in an unusable repack; downgrade to 2.12 to be safe!";
